@@ -4,7 +4,7 @@ import pytest
 from biforex.config import Settings
 from biforex.trading import bot as bot_module
 from biforex.trading.bot import Bot
-from biforex.trading.live_data import Prediction
+from biforex.trading.live_data import Decision
 from biforex.trading.state import Plan, State
 
 BAR = pd.Timestamp("2026-09-28 08:00", tz="UTC")
@@ -69,14 +69,14 @@ class FakeClient:
         return []
 
 
-class FakePredictor:
-    def __init__(self, probs):
-        self.probs = probs  # symbol -> (p_down, p_flat, p_up)
+class FakeScorer:
+    def __init__(self, scores):
+        self.scores = scores  # symbol -> ensemble score
 
-    def predict(self, s, bar):
+    def decide(self, s, bar):
         close = 83_000.0 if s == "BTCUSDT" else 2700.0
         atr = 0.011 * close
-        return Prediction(bar, *self.probs[s], atr=atr, close=close)
+        return Decision(bar, self.scores[s], close=close, atr=atr, parts={"x": self.scores[s]})
 
 
 @pytest.fixture
@@ -87,14 +87,14 @@ def make_bot(tmp_path, monkeypatch):
     def make(probs, equity=20.0, notifier=None):
         s = Settings(symbols=["BTCUSDT", "ETHUSDT"])
         client = FakeClient(equity)
-        b = Bot(s, client, State(tmp_path / "state.sqlite"), FakePredictor(probs),
+        b = Bot(s, client, State(tmp_path / "state.sqlite"), FakeScorer(probs),
                 notifier=notifier)
         return b, client
     return make
 
 
-NONE = (0.3, 0.4, 0.3)
-UP = (0.2, 0.35, 0.45)
+NONE = 0.0
+UP = 0.18  # above enter_score 0.10
 
 
 def test_entries_use_exchange_minimum_and_limit_below_close(make_bot):

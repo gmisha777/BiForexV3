@@ -20,6 +20,7 @@ class DataConfig(BaseModel):
     funding: bool = True
     metrics: bool = True
     download_workers: int = 8
+    extra_symbols: list[str] = Field(default_factory=list)  # downloaded for training only
 
 
 class FeaturesConfig(BaseModel):
@@ -38,8 +39,9 @@ class LabelConfig(BaseModel):
 
 
 class ModelConfig(BaseModel):
+    """Settings of the LightGBM triple-barrier strategy (lgbm_tb)."""
+
     pooled: bool = True  # one model for all symbols, symbol_id as a feature
-    extra_symbols: list[str] = Field(default_factory=list)  # used for training only
     val_fraction: float = 0.15  # tail of each training window used for early stopping
     early_stopping_rounds: int = 300
     params: dict = Field(default_factory=lambda: {
@@ -54,14 +56,22 @@ class ModelConfig(BaseModel):
     })
 
 
-class SignalConfig(BaseModel):
-    enter_prob: float = 0.40
-    exit_prob: float = 0.40
+class StrategyConfig(BaseModel):
+    enabled: bool = True
+    weight: float = 1.0
+    params: dict = Field(default_factory=dict)  # strategy-specific settings
+
+
+class EnsembleConfig(BaseModel):
+    """Combined score = weighted mean of the enabled strategies' scores (-1..+1)."""
+
+    enter_score: float = 0.10  # |score| needed to open a position
+    exit_score: float = 0.10  # opposite |score| that closes a position
 
 
 class BacktestConfig(BaseModel):
     initial_equity: float = 5000.0
-    threshold_grid: list[float] = Field(default_factory=lambda: [0.36, 0.38, 0.40, 0.42, 0.45])
+    threshold_grid: list[float] = Field(default_factory=lambda: [0.04, 0.07, 0.10, 0.13, 0.175])
 
 
 class RiskConfig(BaseModel):
@@ -105,8 +115,10 @@ class Settings(BaseModel):
     data: DataConfig = Field(default_factory=DataConfig)
     features: FeaturesConfig = Field(default_factory=FeaturesConfig)
     label: LabelConfig = Field(default_factory=LabelConfig)
+    strategies: dict[str, StrategyConfig] = Field(
+        default_factory=lambda: {"lgbm_tb": StrategyConfig()})
+    ensemble: EnsembleConfig = Field(default_factory=EnsembleConfig)
     model: ModelConfig = Field(default_factory=ModelConfig)
-    signal: SignalConfig = Field(default_factory=SignalConfig)
     backtest: BacktestConfig = Field(default_factory=BacktestConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
@@ -116,8 +128,13 @@ class Settings(BaseModel):
 
     @property
     def all_symbols(self) -> list[str]:
-        """Traded symbols first, then symbols used only to train the pooled model."""
-        return self.symbols + [s for s in self.model.extra_symbols if s not in self.symbols]
+        """Traded symbols first, then symbols used only for training."""
+        return self.symbols + [s for s in self.data.extra_symbols if s not in self.symbols]
+
+    @property
+    def enabled_strategies(self) -> dict[str, float]:
+        """Enabled strategy name -> weight."""
+        return {n: c.weight for n, c in self.strategies.items() if c.enabled and c.weight > 0}
 
     def resolve_paths(self, root: Path) -> Settings:
         """Make relative directories absolute against the project root."""

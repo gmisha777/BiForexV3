@@ -20,9 +20,10 @@ import requests
 
 from ..config import PROJECT_ROOT, Settings
 from ..data.schema import timeframe_delta
+from ..ensemble import entry_side, exit_signal
 from ..notify import Notifier, net_error
 from .binance import BinanceError, BinanceFutures
-from .live_data import Prediction, Predictor, refresh_data
+from .live_data import Decision, Scorer, refresh_data
 from .rules import SymbolRules, position_size
 from .state import Plan, State
 
@@ -50,11 +51,11 @@ def _ms(ts: str | pd.Timestamp) -> int:
 
 class Bot:
     def __init__(self, settings: Settings, client: BinanceFutures, state: State,
-                 predictor: Predictor, dry_run: bool = False, notifier: Notifier | None = None):
+                 scorer: Scorer, dry_run: bool = False, notifier: Notifier | None = None):
         self.s = settings
         self.client = client
         self.state = state
-        self.predictor = predictor
+        self.scorer = scorer
         self.dry_run = dry_run
         self.notify = notifier or Notifier()
         self.symbols = settings.symbols
@@ -179,10 +180,9 @@ class Bot:
         last = self.state.last_signals(len(self.symbols))
         if last:
             bar = pd.Timestamp(last[0]["bar"]) + self.bar
-            probs = ", ".join(f"{r['symbol'][:3]} ↑{r['p_up']:.2f} ↓{r['p_down']:.2f}"
-                              for r in last)
-            lines.append(f"Останній сигнал {_local(bar):%d.%m %H:%M}: {probs} "
-                         f"(вхід від {self.s.signal.enter_prob:g})")
+            scores = ", ".join(f"{r['symbol'][:3]} {r['score']:+.2f}" for r in last)
+            lines.append(f"Остання оцінка {_local(bar):%d.%m %H:%M}: {scores} "
+                         f"(вхід від ±{self.s.ensemble.enter_score:g})")
         if self.state.get("halted"):
             lines.append("⛔ Нові входи ЗУПИНЕНО (макс. просадка)")
         if STOP_FILE.exists():
@@ -391,12 +391,12 @@ class Bot:
                 self.client.cancel(s, plan.entry_cid)
                 self.sync(s)
 
-        # 2. data and predictions
+        # 2. data and the ensemble's scores
         fc = self.s.features.context_symbol
         refresh_data(self.s, sorted(set(self.symbols) | {fc}), self.session)
-        preds: dict[str, Prediction | None] = {}
+        preds: dict[str, Decision | None] = {}
         for s in self.symbols:
-            preds[s] = self.predictor.predict(s, bar)
+            preds[s] = self.scorer.decide(s, bar)
             if preds[s]:
                 self.state.set(f"last_atr:{s}", preds[s].atr)
 
@@ -407,16 +407,15 @@ class Bot:
                  f" | new entries blocked: {blocked}" if blocked else "")
 
         # 4. exits: time limit, strong opposite signal
-        horizon, sc = self.s.label.horizon_bars, self.s.signal
+        horizon, sc = self.s.label.horizon_bars, self.s.ensemble
         for s in self.symbols:
             plan, p = self.state.plan(s), preds[s]
             if not plan or plan.status != "open":
                 continue
             held = int((bar - pd.Timestamp(plan.signal_bar)) / self.bar)
-            opposite = (p.p_down if plan.side == 1 else p.p_up) if p else 0.0
             if held >= horizon:
                 self.close_market(s, "time")
-            elif opposite >= sc.exit_prob:
+            elif p is not None and exit_signal(plan.side, p.score, sc.exit_score):
                 self.close_market(s, "signal")
 
         # 5. entries
@@ -424,22 +423,23 @@ class Bot:
             p = preds[s]
             if p is None:
                 continue
-            side = self.forced.pop(s, None) or self._signal(p)
+            side = self.forced.pop(s, None) or entry_side(p.score, sc.enter_score)
             action = {1: "long", -1: "short", 0: "none"}[side]
             if side == 0:
-                self.state.add_signal(bar.isoformat(), s, p.probs, action)
+                self.state.add_signal(bar.isoformat(), s, p.score, p.parts, action)
                 continue
             if self.state.plan(s):
-                self.state.add_signal(bar.isoformat(), s, p.probs, action, "position open")
+                self.state.add_signal(bar.isoformat(), s, p.score, p.parts, action, "position open")
                 continue
             if not allow_entries:
                 blocked = blocked or "bar processed late"
             if blocked:
-                self.state.add_signal(bar.isoformat(), s, p.probs, action, f"blocked: {blocked}")
+                self.state.add_signal(bar.isoformat(), s, p.score, p.parts, action,
+                                      f"blocked: {blocked}")
                 log.info("%s: %s signal skipped (%s)", s, action, blocked)
                 continue
             detail = self._enter(s, side, p, bar, equity)
-            self.state.add_signal(bar.isoformat(), s, p.probs, action, detail)
+            self.state.add_signal(bar.isoformat(), s, p.score, p.parts, action, detail)
 
     def _risk_block(self, bar: pd.Timestamp, equity: float) -> str:
         rc = self.s.risk
@@ -469,15 +469,7 @@ class Bot:
             return "STOP file present"
         return ""
 
-    def _signal(self, p: Prediction) -> int:
-        th = self.s.signal.enter_prob
-        if p.p_up >= th and p.p_up > p.p_down:
-            return 1
-        if p.p_down >= th and p.p_down > p.p_up:
-            return -1
-        return 0
-
-    def _enter(self, s: str, side: int, p: Prediction, bar: pd.Timestamp, equity: float) -> str:
+    def _enter(self, s: str, side: int, p: Decision, bar: pd.Timestamp, equity: float) -> str:
         r, ex, rc = self.rules[s], self.s.execution, self.s.risk
         limit = p.close - side * ex.limit_offset_atr * p.atr
         limit = r.round_price(limit, up=side == -1)

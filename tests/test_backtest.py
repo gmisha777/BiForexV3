@@ -17,9 +17,9 @@ def make_bars(rows: list[tuple[float, float, float, float]]) -> pd.DataFrame:
 def preds_for(n: int, signals: dict[int, str], atr: float = 2.0, symbol="X") -> pd.DataFrame:
     """signals: bar index -> 'up' / 'down'."""
     t = pd.date_range(T0, periods=n, freq="4h")
-    p = pd.DataFrame({"symbol": symbol, "p_up": 0.3, "p_down": 0.3, "atr": atr}, index=t)
+    p = pd.DataFrame({"symbol": symbol, "score": 0.0, "atr": atr}, index=t)
     for i, s in signals.items():
-        p.iloc[i, p.columns.get_loc("p_up" if s == "up" else "p_down")] = 0.5
+        p.iloc[i, p.columns.get_loc("score")] = 0.3 if s == "up" else -0.3
     return p
 
 

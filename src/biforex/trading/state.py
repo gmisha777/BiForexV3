@@ -24,8 +24,8 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_time TEXT, entry REAL, exit REAL, qty REAL, realized REAL, fees REAL, funding REAL,
     pnl REAL, reason TEXT
 );
-CREATE TABLE IF NOT EXISTS signals (
-    bar TEXT, symbol TEXT, p_down REAL, p_flat REAL, p_up REAL, action TEXT, detail TEXT,
+CREATE TABLE IF NOT EXISTS scores (
+    bar TEXT, symbol TEXT, score REAL, parts TEXT, action TEXT, detail TEXT,
     PRIMARY KEY (bar, symbol)
 );
 """
@@ -94,12 +94,13 @@ class State:
         names = [d[0] for d in cur.description]
         return [dict(zip(names, r, strict=True)) for r in cur.fetchall()]
 
-    def add_signal(self, bar: str, symbol: str, probs: tuple[float, float, float], action: str,
+    def add_signal(self, bar: str, symbol: str, score: float, parts: dict, action: str,
                    detail: str = "") -> None:
-        self.db.execute("INSERT OR REPLACE INTO signals VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (bar, symbol, *map(float, probs), action, detail))
+        """Ensemble score of a bar, per-strategy scores (JSON) and what the bot did."""
+        self.db.execute("INSERT OR REPLACE INTO scores VALUES (?, ?, ?, ?, ?, ?)",
+                        (bar, symbol, float(score), json.dumps(parts), action, detail))
 
     def last_signals(self, n: int) -> list[dict]:
-        cur = self.db.execute("SELECT * FROM signals ORDER BY bar DESC, symbol LIMIT ?", (n,))
+        cur = self.db.execute("SELECT * FROM scores ORDER BY bar DESC, symbol LIMIT ?", (n,))
         names = [d[0] for d in cur.description]
         return [dict(zip(names, r, strict=True)) for r in cur.fetchall()]

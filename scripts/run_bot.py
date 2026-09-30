@@ -23,7 +23,7 @@ from biforex.config import load_settings
 from biforex.log import setup_logging
 from biforex.trading.binance import BinanceFutures
 from biforex.trading.bot import Bot
-from biforex.trading.live_data import Predictor
+from biforex.trading.live_data import Scorer
 from biforex.trading.state import State
 
 log = logging.getLogger("run_bot")
@@ -78,7 +78,7 @@ def main() -> int:
                             os.environ.get(f"{prefix}_SECRET", ""), demo=demo)
     state = State(settings.data.dir / "bot" / f"{mode}{'_dry' if args.dry_run else ''}.sqlite")
     notifier = notify.from_env() if not (args.dry_run or args.once) else notify.Notifier()
-    bot = Bot(settings, client, state, Predictor(settings), dry_run=args.dry_run,
+    bot = Bot(settings, client, state, Scorer(settings), dry_run=args.dry_run,
               notifier=notifier)
     log.info("telegram notifications: %s", "on" if notifier.enabled else "off")
     equity, available = client.usdt_equity()

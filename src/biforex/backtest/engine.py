@@ -6,7 +6,8 @@ Timeline for a bar with open_time t (it covers [t, t + bar)):
      high/low (both touched -> intrabar data decides, else the stop is assumed first);
      funding settled inside the bar is charged;
   2. at the bar close the model prediction for row t becomes available:
-     time exit (after `horizon` bars), exit on a strong opposite signal, then new entries.
+     time exit (after `horizon` bars), exit when the ensemble score turns against the position
+     (|score| >= exit_score), then new entries (|score| >= enter_score).
 Entries are market orders (taker fee + slippage) or limit orders valid for one bar (maker fee,
 filled only if the price trades through the limit). Stops, time and signal exits are market
 orders; the take profit is a market order or, optionally, a resting limit (maker).
@@ -19,6 +20,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+from ..ensemble import entry_side, exit_signal
 from ..labels.triple_barrier import IntrabarResolver, _to_ns, limit_through
 from ..trading.rules import SymbolRules, position_size
 
@@ -37,8 +39,8 @@ class BacktestParams:
     tp_atr: float = 2.0
     sl_atr: float = 1.0
     horizon: int = 12  # bars
-    enter_prob: float = 0.40
-    exit_prob: float = 0.40  # opposite-side probability that closes a position
+    enter_score: float = 0.10  # |combined score| that opens a position
+    exit_score: float = 0.10  # combined score against the position that closes it
     daily_loss_pct: float = 3.0  # no new entries for the rest of the UTC day
     max_dd_pct: float = 15.0  # stop opening positions for good
     bar: pd.Timedelta = field(default_factory=lambda: pd.Timedelta("4h"))
@@ -89,7 +91,7 @@ class Backtester:
         intrabar: dict[str, pd.DataFrame] | None = None,
     ):
         """bars: per symbol, stored klines (open_time, open, high, low, close).
-        predictions: open_time index, columns symbol, p_up, p_down, atr."""
+        predictions: open_time index, columns symbol, score (-1..+1, the ensemble), atr."""
         self.p = params
         self.symbols = sorted(predictions["symbol"].unique())
         self.bars = {s: bars[s].set_index("open_time")[["open", "high", "low", "close"]]
@@ -267,14 +269,13 @@ class Backtester:
                 pos = self.positions.get(s)
                 if pos is not None:
                     pos.bars_held += 1
-                    opposite = row["p_down"] if pos.side == 1 else row["p_up"]
                     if pos.bars_held >= p.horizon:
                         self._close(pos, close, t_close, "time")
-                    elif opposite >= p.exit_prob:
+                    elif exit_signal(pos.side, row["score"], p.exit_score):
                         self._close(pos, close, t_close, "signal")
                 if s in self.positions or halted_at is not None or day_blocked:
                     continue
-                side = self._signal(row)
+                side = entry_side(row["score"], p.enter_score)
                 if side:
                     self._enter(s, side, t_close, close, row["atr"], self._equity(closes))
             equity_curve[t_close] = self._equity(closes)
@@ -284,14 +285,6 @@ class Backtester:
             self._close(self.positions[s], last[s], self.bars[s].index[-1] + p.bar, "end")
         return BacktestResult(pd.DataFrame(self.trades), pd.Series(equity_curve, name="equity"),
                               halted_at, self.limit_orders, self.limit_fills)
-
-    def _signal(self, row: pd.Series) -> int:
-        up, down, th = row["p_up"], row["p_down"], self.p.enter_prob
-        if up >= th and up > down:
-            return 1
-        if down >= th and down > up:
-            return -1
-        return 0
 
     def _equity(self, closes: dict[str, float]) -> float:
         unrealized = sum(

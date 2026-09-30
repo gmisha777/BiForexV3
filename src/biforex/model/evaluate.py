@@ -105,3 +105,39 @@ def top_features(importance: pd.DataFrame, n: int = 20) -> pd.DataFrame:
         "gain_share_pct": 100 * share.mean(),
         "folds_in_top20_pct": 100 * (share.rank(axis=1, ascending=False) <= 20).mean(),
     }).sort_values("gain_share_pct", ascending=False).head(n)
+
+
+SCORE_THRESHOLDS = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30)
+
+
+def attach_outcomes(scores: pd.DataFrame, settings) -> pd.DataFrame:
+    """Join triple-barrier outcomes (the shared exit rules) to (open_time, symbol) scores."""
+    from ..data import store
+    from ..labels.build import labels_path
+
+    parts = []
+    for symbol, g in scores.groupby("symbol"):
+        lab = store.load(labels_path(settings, symbol))
+        if lab is None:
+            continue
+        lab = lab.set_index("open_time")
+        parts.append(g.join(lab[["long_outcome", "long_ret", "short_outcome", "short_ret"]],
+                            how="inner"))
+    return pd.concat(parts).dropna(subset=["long_ret", "short_ret"]).sort_index()
+
+
+def score_signal_table(df: pd.DataFrame, cost: float,
+                       thresholds: tuple[float, ...] = SCORE_THRESHOLDS) -> pd.DataFrame:
+    """Long when score >= th, short when score <= -th; every bar a separate trade."""
+    n = len(df)
+    rows = {
+        ("long", "every bar"): _trade_stats(df["long_ret"], df["long_outcome"], cost, n),
+        ("short", "every bar"): _trade_stats(df["short_ret"], df["short_outcome"], cost, n),
+    }
+    for th in thresholds:
+        lg, sh = df[df["score"] >= th], df[df["score"] <= -th]
+        rows[("long", f"score>={th:.2f}")] = _trade_stats(lg["long_ret"], lg["long_outcome"],
+                                                         cost, n)
+        rows[("short", f"score<=-{th:.2f}")] = _trade_stats(sh["short_ret"],
+                                                           sh["short_outcome"], cost, n)
+    return pd.DataFrame(rows).T

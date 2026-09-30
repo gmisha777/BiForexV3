@@ -60,7 +60,7 @@ def main() -> int:
               f"    stops {algos} | orders {orders}")
 
     db = sqlite3.connect(path)
-    sig = pd.read_sql(f"SELECT * FROM signals ORDER BY bar DESC LIMIT {int(args.signals)}", db)
+    sig = pd.read_sql(f"SELECT * FROM scores ORDER BY bar DESC LIMIT {int(args.signals)}", db)
     print("\nrecent signals:\n", sig.round(3).to_string(index=False) if len(sig) else "none")
     trades = pd.DataFrame(state.trades())
     if trades.empty:

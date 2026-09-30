@@ -1,7 +1,9 @@
-"""Backtest the out-of-sample walk-forward predictions (run scripts/train.py first).
+"""Backtest the ensemble on out-of-sample walk-forward scores (run scripts/train.py first).
 
 Usage:
-    python scripts/backtest.py
+    python scripts/backtest.py                                  # strategies/weights from config
+    python scripts/backtest.py --strategies lgbm_tb other --weights 1 2
+    python scripts/backtest.py --equity 20 --exchange-limits    # small account, Binance minimums
 """
 
 from __future__ import annotations
@@ -18,8 +20,9 @@ from biforex.backtest.engine import BacktestParams, run_backtest
 from biforex.config import PROJECT_ROOT, Settings, load_settings
 from biforex.data import store
 from biforex.data.schema import timeframe_delta
+from biforex.ensemble import load_oos, resolve_weights
+from biforex.labels.build import labels_path
 from biforex.log import setup_logging
-from biforex.model.registry import POOLED
 from biforex.trading.rules import SymbolRules
 
 log = logging.getLogger("backtest")
@@ -42,8 +45,8 @@ def params_from(settings: Settings, enter: float, exit_: float,
         tp_atr=settings.label.tp_atr,
         sl_atr=settings.label.sl_atr,
         horizon=settings.label.horizon_bars,
-        enter_prob=enter,
-        exit_prob=exit_,
+        enter_score=enter,
+        exit_score=exit_,
         daily_loss_pct=settings.risk.daily_loss_pct,
         max_dd_pct=settings.risk.max_dd_pct,
         bar=timeframe_delta(settings.timeframe),
@@ -52,29 +55,45 @@ def params_from(settings: Settings, enter: float, exit_: float,
     )
 
 
+def attach_atr(settings: Settings, preds: pd.DataFrame) -> pd.DataFrame:
+    """ATR at each bar (for stop / take profit distances) from the shared labels."""
+    parts = []
+    for symbol, g in preds.groupby("symbol"):
+        lab = store.load(labels_path(settings, symbol)).set_index("open_time")["atr"]
+        parts.append(g.join(lab, how="inner"))
+    return pd.concat(parts).dropna(subset=["atr"]).sort_index(kind="stable")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", help="path to config.yaml")
     parser.add_argument("--equity", type=float, help="starting equity (default from config)")
     parser.add_argument("--exchange-limits", action="store_true",
                         help="apply Binance minimum order sizes (as the live bot does)")
+    parser.add_argument("--strategies", nargs="+", help="strategies to combine (default: config)")
+    parser.add_argument("--weights", nargs="+", type=float, help="weights for --strategies")
     args = parser.parse_args()
     settings = load_settings(args.config)
     if args.equity:
         settings.backtest.initial_equity = args.equity
     setup_logging(settings.logging.level, settings.logging.dir)
 
-    name = POOLED if settings.model.pooled else settings.symbols[0]
-    report_dir = PROJECT_ROOT / "reports" / name
-    preds = pd.read_parquet(report_dir / "oos_predictions.parquet")
+    weights = resolve_weights(settings, args.strategies, args.weights)
+    preds = load_oos(settings, weights)
     preds = preds[preds["symbol"].isin(settings.symbols)]  # extra symbols are not traded
     symbols = sorted(preds["symbol"].unique())
+    preds = attach_atr(settings, preds)
+    name = "+".join(f"{n}x{w:g}" for n, w in weights.items())
+    report_dir = PROJECT_ROOT / "reports" / "ensemble" / name
+    log.info("ensemble %s: %d scored bars %s -> %s; bars scored by all strategies: %.0f%%",
+             weights, len(preds), preds.index[0].date(), preds.index[-1].date(),
+             100 * (preds["n_strategies"] == len(weights)).mean())
     d, tf = settings.data.dir, settings.timeframe
     bars = {s: store.load(store.klines_path(d, s, tf)) for s in symbols}
     funding = {s: store.load(store.funding_path(d, s)) for s in symbols}
     intrabar = {s: store.load(store.klines_path(d, s, settings.label.intrabar_interval))
                 for s in symbols}
-    cols = ["symbol", "p_up", "p_down", "atr"]
+    cols = ["symbol", "score", "atr"]
 
     rules = None
     if args.exchange_limits:
@@ -83,8 +102,8 @@ def main() -> int:
         log.info("exchange limits: %s", {s: (r.min_qty, r.min_notional) for s, r in
                                          rules.items()})
 
-    sc = settings.signal
-    main_params = params_from(settings, sc.enter_prob, sc.exit_prob, rules)
+    sc = settings.ensemble
+    main_params = params_from(settings, sc.enter_score, sc.exit_score, rules)
     result = run_backtest(bars, preds[cols], main_params, funding, intrabar)
     out = report_dir / "backtest"
     out.mkdir(parents=True, exist_ok=True)
@@ -92,8 +111,8 @@ def main() -> int:
     result.equity.to_csv(out / "equity.csv")
 
     s = metrics.summary(result, main_params.initial_equity)
-    log.info("backtest %s -> %s | enter p>=%.2f, exit p>=%.2f | risk %.1f%%/trade | "
-             "entry %s", s["start"], s["end"], sc.enter_prob, sc.exit_prob,
+    log.info("backtest %s -> %s | enter |score|>=%.2f, exit %.2f | risk %.1f%%/trade | "
+             "entry %s", s["start"], s["end"], sc.enter_score, sc.exit_score,
              main_params.risk_pct, main_params.entry)
     log.info("summary:\n%s", pd.Series(s).to_string())
     if result.limit_orders:

@@ -10,6 +10,7 @@ data:
   funding: true
   metrics: true              # open interest, long/short ratios (5-minute, daily archives)
   download_workers: 8
+  extra_symbols: []          # downloaded for training only, not traded
 
 features:
   context_symbol: BTCUSDT    # its returns/volatility are added as features for other symbols
@@ -17,16 +18,25 @@ features:
   metrics_max_staleness: 3h  # open interest older than this counts as missing
   warmup_bars: 700           # first bars dropped: long EMAs are not ready yet
 
-label:                       # triple-barrier: which is hit first within the horizon
+label:                       # triple-barrier labels = SHARED exit rules of all strategies
   horizon_bars: 12           # time barrier, bars (12 x 4h = 2 days)
   tp_atr: 2.0                # take profit, ATR multiples
   sl_atr: 1.0                # stop loss, ATR multiples
   atr_period: 14
   intrabar_interval: 1m      # resolves bars where both TP and SL were touched
 
-model:                       # LightGBM, 3 classes: down / flat / up
+strategies:                  # decision approaches; each gives a score -1 (down) .. +1 (up)
+  lgbm_tb:                   # LightGBM on triple-barrier labels (settings in "model" below)
+    enabled: true
+    weight: 1.0              # combined score = weighted mean over enabled strategies
+
+ensemble:
+  enter_score: 0.10          # open when combined score >= +this (long) or <= -this (short)
+  exit_score: 0.10           # close when the score reaches this against the position
+                             # (lgbm_tb alone: 0.10 == old rule "p >= 0.40 and dominant")
+
+model:                       # strategy lgbm_tb: LightGBM, 3 classes down / flat / up
   pooled: true               # one model for all symbols (symbol_id feature); more data, more stable
-  extra_symbols: []          # training-only symbols; 8 alts tested 2026-09-28: better log-loss, worse trading
   val_fraction: 0.15         # tail of the training window used for early stopping
   early_stopping_rounds: 300
   params:                    # strongly regularized: with lighter settings it overfit in <10 trees
@@ -39,13 +49,9 @@ model:                       # LightGBM, 3 classes: down / flat / up
     colsample_bytree: 0.5
     reg_lambda: 10.0
 
-signal:                      # model probabilities rarely exceed 0.5 (3 classes, noisy market)
-  enter_prob: 0.40           # open when p_up (p_down) >= this and exceeds the other side
-  exit_prob: 0.40            # close when the opposite side's probability reaches this
-
 backtest:
   initial_equity: 5000       # same as the demo account
-  threshold_grid: [0.36, 0.38, 0.40, 0.42, 0.45]   # all shown, to judge robustness
+  threshold_grid: [0.04, 0.07, 0.10, 0.13, 0.175]  # enter/exit score (= p 0.36..0.45), all shown
 
 risk:
   per_trade_pct: 1.0         # target risk to the stop, % of equity

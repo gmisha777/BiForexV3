@@ -1,20 +1,18 @@
-"""Bring local data up to the last closed bar and predict it with the current model."""
+"""Bring local data up to the last closed bar and score it with the strategy ensemble."""
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-import numpy as np
 import pandas as pd
 import requests
 
 from ..config import Settings
 from ..data import rest, store
 from ..data.update import update_funding, update_klines, update_metrics
-from ..features.pipeline import build_features
-from ..model import PROBA_COLUMNS
-from ..model.registry import POOLED, load_current
+from ..ensemble import LiveEnsemble
+from ..features import indicators as ind
 
 log = logging.getLogger(__name__)
 
@@ -34,47 +32,44 @@ def refresh_data(settings: Settings, symbols: list[str], session: requests.Sessi
 
 
 @dataclass
-class Prediction:
+class Decision:
+    """Ensemble view of one closed bar for one symbol."""
+
     bar: pd.Timestamp  # open time of the closed bar
-    p_down: float
-    p_flat: float
-    p_up: float
-    atr: float
+    score: float  # combined score, -1..+1
     close: float
-
-    @property
-    def probs(self) -> tuple[float, float, float]:
-        return self.p_down, self.p_flat, self.p_up
+    atr: float  # for stop / take-profit distances (same ATR as the labels)
+    parts: dict[str, float | None] = field(default_factory=dict)  # per-strategy scores
 
 
-class Predictor:
-    def __init__(self, settings: Settings):
+class Scorer:
+    """Scores the latest closed bar with the enabled strategies."""
+
+    def __init__(self, settings: Settings, ensemble: LiveEnsemble | None = None):
         self.settings = settings
-        name = POOLED if settings.model.pooled else settings.symbols[0]
-        self.booster, self.meta = load_current(name)
-        if self.meta["timeframe"] != settings.timeframe:
-            raise RuntimeError(f"model timeframe {self.meta['timeframe']} != config "
-                               f"{settings.timeframe}; retrain")
-        log.info("model %s/%s: trained until %s, %d trees, symbols %s", name,
-                 self.meta["version"], self.meta["trained_until"], self.meta["trees"],
-                 self.meta["symbols"])
+        self.ensemble = ensemble or LiveEnsemble(settings)
+        self.ensemble.load()
 
-    def predict(self, symbol: str, bar: pd.Timestamp) -> Prediction | None:
-        """Prediction for the bar with open time `bar`, or None if its data is not there."""
-        features = build_features(self.settings, symbol)
-        if bar not in features.index:
-            log.warning("%s: no features for bar %s (last %s)", symbol, bar, features.index[-1])
+    def market(self, symbol: str, bar: pd.Timestamp) -> tuple[float, float] | None:
+        """Close and ATR of the bar."""
+        s = self.settings
+        k = store.load(store.klines_path(s.data.dir, symbol, s.timeframe))
+        k = k.set_index("open_time")
+        if bar not in k.index:
             return None
-        row = features.loc[[bar]].copy()
-        if "symbol_id" in self.meta["features"]:
-            row["symbol_id"] = np.float32(self.meta["symbols"].index(symbol))
-        X = row.reindex(columns=self.meta["features"])
-        p = self.booster.predict(X)[0]
-        klines = store.load(store.klines_path(self.settings.data.dir, symbol,
-                                              self.settings.timeframe)).set_index("open_time")
-        close = float(klines.at[bar, "close"])
-        atr = float(row["atr_pct"].iloc[0]) * close
-        pred = Prediction(bar, *map(float, p), atr=atr, close=close)
-        log.info("%s bar %s close %.2f ATR %.2f | %s", symbol, bar, close, atr,
-                 " ".join(f"{c}={v:.3f}" for c, v in zip(PROBA_COLUMNS, p, strict=True)))
-        return pred
+        atr = ind.atr(k["high"], k["low"], k["close"], s.label.atr_period)
+        return float(k.at[bar, "close"]), float(atr.at[bar])
+
+    def decide(self, symbol: str, bar: pd.Timestamp) -> Decision | None:
+        market = self.market(symbol, bar)
+        if market is None:
+            log.warning("%s: bar %s not in local data", symbol, bar)
+            return None
+        score, parts = self.ensemble.score(symbol, bar)
+        if score is None:
+            log.warning("%s: no strategy produced a score for %s", symbol, bar)
+            return None
+        close, atr = market
+        log.info("%s bar %s close %.2f ATR %.2f | ensemble score %+.3f %s", symbol, bar, close,
+                 atr, score, {n: None if v is None else round(v, 3) for n, v in parts.items()})
+        return Decision(bar, score, close, atr, parts)
