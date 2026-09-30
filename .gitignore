@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Secrets
+.env
+*.key
+key.txt
+
+# Data, models, logs
+data/
+models/
+logs/
+reports/
+
+# IDE
+.vscode/
+.idea/
+
+# Legacy MT4/MATLAB sources (reference only; the .mlapp contains a plain-text e-mail password)
+info/
