@@ -29,6 +29,8 @@ class WalkForwardScores:
 
 class Strategy(ABC):
     name: ClassVar[str]
+    # extra kline intervals the strategy reads live (the trading timeframe is always updated)
+    data_intervals: ClassVar[tuple[str, ...]] = ()
 
     def __init__(self, settings: Settings, params: dict | None = None):
         self.settings = settings
@@ -36,7 +38,8 @@ class Strategy(ABC):
 
     @property
     def report_dir(self):
-        return PROJECT_ROOT / "reports" / self.name
+        """reports/<strategy>/<timeframe>/: research on another timeframe never overwrites."""
+        return PROJECT_ROOT / "reports" / self.name / self.settings.report_key
 
     # --- research ------------------------------------------------------------------------
     @abstractmethod
@@ -59,3 +62,13 @@ class Strategy(ABC):
 
 def clip_score(x: float) -> float:
     return max(-1.0, min(1.0, float(x)))
+
+
+def calibration_scale(raw: pd.Series, top_share: float) -> float:
+    """Scale q for rule strategies: score = raw / q * 0.10, so |score| >= 0.10 (the entry
+    level used for all strategies) on the `top_share` of bars with the strongest raw signal.
+    Call it on in-sample data only."""
+    q = float(raw.abs().quantile(1 - top_share))
+    if not q > 0:
+        raise ValueError("raw signal is zero on too many bars to calibrate")
+    return q

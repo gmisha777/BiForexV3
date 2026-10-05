@@ -67,6 +67,7 @@ class EnsembleConfig(BaseModel):
 
     enter_score: float = 0.10  # |score| needed to open a position
     exit_score: float = 0.10  # opposite |score| that closes a position
+    abstain_on_zero: bool = True  # score exactly 0 = "no view": left out of the mean
 
 
 class BacktestConfig(BaseModel):
@@ -80,6 +81,8 @@ class RiskConfig(BaseModel):
     max_leverage: float = 5
     daily_loss_pct: float = 6.0
     max_dd_pct: float = 30.0
+    max_positions: int = 0  # open positions + pending entries at once (0 = no limit)
+    max_same_side: int = 0  # of them in the same direction (0 = no limit)
 
 
 class BotConfig(BaseModel):
@@ -97,6 +100,8 @@ class ExecutionConfig(BaseModel):
     limit_offset_atr: float = 0.1  # limit price this many ATR better than the signal close
     take_profit_limit: bool = True  # TP as a resting limit order (maker)
     exchange_leverage: int = 10  # isolated-margin setting: margin = notional / this
+    stop_order: str = "market"  # "market" (STOP_MARKET) | "stop_limit" (STOP + limit price)
+    stop_limit_offset_atr: float = 0.1  # stop_limit: limit this far beyond the trigger
 
 
 class RetrainConfig(BaseModel):
@@ -112,6 +117,7 @@ class LoggingConfig(BaseModel):
 class Settings(BaseModel):
     symbols: list[str]
     timeframe: str = "4h"
+    report_tag: str = ""  # research runs: reports go to reports/<strategy>/<timeframe>_<tag>/
     data: DataConfig = Field(default_factory=DataConfig)
     features: FeaturesConfig = Field(default_factory=FeaturesConfig)
     label: LabelConfig = Field(default_factory=LabelConfig)
@@ -130,6 +136,11 @@ class Settings(BaseModel):
     def all_symbols(self) -> list[str]:
         """Traded symbols first, then symbols used only for training."""
         return self.symbols + [s for s in self.data.extra_symbols if s not in self.symbols]
+
+    @property
+    def report_key(self) -> str:
+        """Folder of strategy reports below reports/<strategy>/."""
+        return f"{self.timeframe}_{self.report_tag}" if self.report_tag else self.timeframe
 
     @property
     def enabled_strategies(self) -> dict[str, float]:

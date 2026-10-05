@@ -28,27 +28,43 @@ def create(name: str, settings: Settings) -> Strategy:
     return REGISTRY[name](settings, cfg.params if cfg else {})
 
 
-def oos_path(strategy: Strategy | str):
-    name = strategy if isinstance(strategy, str) else strategy.name
-    return PROJECT_ROOT / "reports" / name / "oos_scores.parquet"
+def oos_path(name: str, report_key: str):
+    """report_key: settings.report_key (the timeframe, plus a research tag if any)."""
+    return PROJECT_ROOT / "reports" / name / report_key / "oos_scores.parquet"
 
 
 def save_oos_scores(strategy: Strategy, scores: pd.DataFrame) -> None:
-    path = oos_path(strategy)
+    path = oos_path(strategy.name, strategy.settings.report_key)
     path.parent.mkdir(parents=True, exist_ok=True)
     scores[["symbol", "score"]].to_parquet(path)
 
 
-def load_oos_scores(name: str) -> pd.DataFrame:
-    path = oos_path(name)
+def load_oos_scores(name: str, report_key: str) -> pd.DataFrame:
+    path = oos_path(name, report_key)
     if not path.exists():
-        raise FileNotFoundError(f"no walk-forward scores for {name}: run scripts/train.py "
-                                f"--strategies {name}")
+        raise FileNotFoundError(f"no {report_key} walk-forward scores for {name}: run "
+                                f"scripts/train.py --strategies {name}")
     return pd.read_parquet(path)
 
 
 # strategy modules register themselves on import
-from . import lgbm_tb  # noqa: E402, F401
+from . import (  # noqa: E402, F401
+    crowd,
+    flow_1m,
+    lgbm_m1nn,
+    lgbm_tb,
+    meta_filter,
+    nn_evo,
+    nn_h1,
+    nn_profit,
+    nn_seq,
+    nn_slope,
+    pattern_knn,
+    shock_move,
+    som_regime,
+    squeeze_breakout,
+    trend_regime,
+)
 
 __all__ = ["REGISTRY", "Strategy", "WalkForwardScores", "clip_score", "create", "register",
            "load_oos_scores", "save_oos_scores", "oos_path"]

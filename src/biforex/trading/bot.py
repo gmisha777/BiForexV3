@@ -273,19 +273,41 @@ class Bot:
     def _protect(self, s: str, plan: Plan, pos: dict) -> None:
         if self.dry_run:
             return
-        r = self.rules[s]
+        r, ex = self.rules[s], self.s.execution
         qty = abs(pos["qty"])
         close_side = "SELL" if plan.side == 1 else "BUY"
-        algos = {a["clientAlgoId"] for a in self.client.open_algo_orders(s)}
-        if plan.sl_cid not in algos:
+        stop_limit = ex.stop_order == "stop_limit"
+        limit_price = r.round_price(
+            plan.sl_price - plan.side * ex.stop_limit_offset_atr * plan.atr, up=plan.side == -1)
+        if stop_limit and (pos["mark"] - limit_price) * plan.side < 0:
+            # price went through the stop-limit's limit: the order may never fill
+            log.error("%s: price %.2f beyond stop limit %.2f; closing at market", s,
+                      pos["mark"], limit_price)
+            self.close_market(s, "stop")
+            return
+        algos = {a["clientAlgoId"]: a for a in self.client.open_algo_orders(s)}
+        sl = algos.get(plan.sl_cid)
+        if sl is not None and stop_limit and abs(float(sl.get("quantity") or 0) - qty) > r.step / 2:
+            self.client.cancel_algo(plan.sl_cid)  # position size changed: re-place for it
+            sl = None
+        if sl is None:
             plan.sl_cid = self._cid("s")
             self.state.save_plan(plan)
             try:
-                self.client.new_algo_order(
-                    symbol=s, side=close_side, type="STOP_MARKET",
-                    triggerPrice=r.fmt_price(plan.sl_price), closePosition="true",
-                    workingType="CONTRACT_PRICE", clientAlgoId=plan.sl_cid)
-                log.info("%s: stop placed at %.2f", s, plan.sl_price)
+                if stop_limit:
+                    self.client.new_algo_order(
+                        symbol=s, side=close_side, type="STOP", timeInForce="GTC",
+                        quantity=r.fmt_qty(qty), price=r.fmt_price(limit_price),
+                        triggerPrice=r.fmt_price(plan.sl_price), reduceOnly="true",
+                        workingType="CONTRACT_PRICE", clientAlgoId=plan.sl_cid)
+                else:
+                    self.client.new_algo_order(
+                        symbol=s, side=close_side, type="STOP_MARKET",
+                        triggerPrice=r.fmt_price(plan.sl_price), closePosition="true",
+                        workingType="CONTRACT_PRICE", clientAlgoId=plan.sl_cid)
+                log.info("%s: stop%s placed at %.2f", s,
+                         f"-limit (limit {limit_price:.2f})" if stop_limit else "",
+                         plan.sl_price)
             except BinanceError as exc:
                 log.error("%s: cannot place stop (%s); closing position at market", s, exc)
                 self.notify.send(f"⚠️ {s}: біржа відхилила стоп ({exc.msg}); позицію закрито "
@@ -393,7 +415,8 @@ class Bot:
 
         # 2. data and the ensemble's scores
         fc = self.s.features.context_symbol
-        refresh_data(self.s, sorted(set(self.symbols) | {fc}), self.session)
+        refresh_data(self.s, sorted(set(self.symbols) | {fc}), self.session,
+                     getattr(self.scorer, "data_intervals", ()))
         preds: dict[str, Decision | None] = {}
         for s in self.symbols:
             preds[s] = self.scorer.decide(s, bar)
@@ -433,6 +456,8 @@ class Bot:
                 continue
             if not allow_entries:
                 blocked = blocked or "bar processed late"
+            if not blocked:
+                blocked = self._portfolio_block(side)
             if blocked:
                 self.state.add_signal(bar.isoformat(), s, p.score, p.parts, action,
                                       f"blocked: {blocked}")
@@ -440,6 +465,16 @@ class Bot:
                 continue
             detail = self._enter(s, side, p, bar, equity)
             self.state.add_signal(bar.isoformat(), s, p.score, p.parts, action, detail)
+
+    def _portfolio_block(self, side: int) -> str:
+        """Portfolio limits over open positions and pending entries of all symbols."""
+        rc = self.s.risk
+        sides = [p.side for p in (self.state.plan(s) for s in self.symbols) if p]
+        if rc.max_positions and len(sides) >= rc.max_positions:
+            return f"max {rc.max_positions} positions"
+        if rc.max_same_side and sides.count(side) >= rc.max_same_side:
+            return f"max {rc.max_same_side} positions in one direction"
+        return ""
 
     def _risk_block(self, bar: pd.Timestamp, equity: float) -> str:
         rc = self.s.risk

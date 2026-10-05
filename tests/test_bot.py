@@ -190,3 +190,54 @@ def test_notifications_for_closed_trade_and_halt(make_bot):
     b.on_bar_close(BAR)
     assert any("ЗУПИНЕНО" in m for m in n.messages)
     assert any("ETHUSDT LONG закрито (ліміт часу)" in m for m in n.messages)
+
+
+class ProtectClient(FakeClient):
+    def __init__(self, equity=1000.0, mark=2700.0):
+        super().__init__(equity)
+        self.algos, self.mark = [], mark
+
+    def position(self, s):
+        return {"qty": self.positions[s], "entry": 2700.0, "mark": self.mark}
+
+    def new_algo_order(self, **p):
+        self.algos.append(p)
+        return {"algoStatus": "NEW"}
+
+
+def _open_plan(b, c, qty=0.01):
+    c.positions["ETHUSDT"] = qty
+    b.state.save_plan(Plan("ETHUSDT", "open", 1, BAR.isoformat(), 30.0, "bfe1", 0, qty, 2700.0,
+                           BAR.isoformat(), "", 2670.0, "", 2760.0))
+
+
+def test_stop_limit_order_placed_with_limit_beyond_trigger(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot_module, "refresh_data", lambda *a, **k: None)
+    s = Settings(symbols=["BTCUSDT", "ETHUSDT"])
+    s.execution.stop_order = "stop_limit"
+    c = ProtectClient()
+    b = Bot(s, c, State(tmp_path / "s.sqlite"), FakeScorer({"BTCUSDT": 0.0, "ETHUSDT": 0.0}))
+    _open_plan(b, c)
+    b.sync("ETHUSDT")
+    stop = c.algos[0]
+    assert stop["type"] == "STOP" and stop["reduceOnly"] == "true"
+    assert float(stop["triggerPrice"]) == 2670.0 and float(stop["price"]) == 2667.0  # 0.1 ATR
+    assert stop["quantity"] == "0.010"
+
+
+def test_stop_limit_skipped_by_gap_closes_at_market(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot_module, "refresh_data", lambda *a, **k: None)
+    s = Settings(symbols=["BTCUSDT", "ETHUSDT"])
+    s.execution.stop_order = "stop_limit"
+    c = ProtectClient(mark=2650.0)  # below the limit 2667
+    b = Bot(s, c, State(tmp_path / "s.sqlite"), FakeScorer({"BTCUSDT": 0.0, "ETHUSDT": 0.0}))
+    _open_plan(b, c)
+    b.sync("ETHUSDT")
+    assert c.market_closes == ["ETHUSDT"] and c.algos == []
+
+
+def test_portfolio_limit_blocks_second_same_side_entry(make_bot):
+    b, c = make_bot({"BTCUSDT": UP, "ETHUSDT": UP}, equity=1000.0)
+    b.s.risk.max_same_side = 1
+    b.on_bar_close(BAR)
+    assert len(c.orders) == 1  # the second long is blocked

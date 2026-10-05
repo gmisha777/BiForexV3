@@ -2,6 +2,8 @@
 
 combined = sum(w_i * score_i) / sum(w_i) over the strategies that produced a score, so a
 strategy that fails for a bar is left out and the remaining weights are renormalized.
+With abstain_on_zero (default) a score of exactly 0 means "no view" and is left out the same
+way; otherwise it counts as a vote for "nothing" and dilutes the others.
 The same functions drive the backtest and the live bot.
 """
 
@@ -36,19 +38,28 @@ def resolve_weights(settings: Settings, names: list[str] | None = None,
     return chosen
 
 
-def combine(scores: dict[str, float | None], weights: dict[str, float]) -> float | None:
-    """Weighted mean of the available scores; None if no strategy produced one."""
+def combine(scores: dict[str, float | None], weights: dict[str, float],
+            abstain_on_zero: bool = True) -> float | None:
+    """Weighted mean of the available scores; 0.0 if every available strategy abstained,
+    None if no strategy produced a score at all."""
     num = den = 0.0
+    available = False
     for name, w in weights.items():
         s = scores.get(name)
         if s is None or (isinstance(s, float) and math.isnan(s)):
             continue
+        available = True
+        if abstain_on_zero and s == 0:
+            continue
         num += w * s
         den += w
-    return num / den if den > 0 else None
+    if den > 0:
+        return num / den
+    return 0.0 if available else None
 
 
-def combine_frames(frames: dict[str, pd.DataFrame], weights: dict[str, float]) -> pd.DataFrame:
+def combine_frames(frames: dict[str, pd.DataFrame], weights: dict[str, float],
+                   abstain_on_zero: bool = True) -> pd.DataFrame:
     """Offline version of `combine` for walk-forward scores.
     frames: strategy -> DataFrame(index open_time, columns symbol, score).
     Returns index open_time with columns symbol, score, n_strategies and one column per strategy.
@@ -60,13 +71,13 @@ def combine_frames(frames: dict[str, pd.DataFrame], weights: dict[str, float]) -
         wide = f if wide is None else wide.merge(f, on=["open_time", "symbol"], how="outer")
     names = list(weights)
     w = pd.Series(weights)
-    values = wide[names]
+    wide["n_strategies"] = wide[names].notna().sum(axis=1)  # coverage, before abstentions
+    values = wide[names].where(wide[names] != 0) if abstain_on_zero else wide[names]
     mask = values.notna()
     num = (values.fillna(0) * w).sum(axis=1)
     den = (mask * w).sum(axis=1)
-    wide["score"] = num / den.where(den > 0)
-    wide["n_strategies"] = mask.sum(axis=1)
-    wide = wide.dropna(subset=["score"]).sort_values(["open_time", "symbol"])
+    wide["score"] = (num / den.where(den > 0)).fillna(0.0)  # everyone abstained -> 0
+    wide = wide.sort_values(["open_time", "symbol"])
     return wide.set_index("open_time")
 
 
@@ -86,7 +97,8 @@ def exit_signal(position_side: int, score: float, exit_score: float) -> bool:
 
 def load_oos(settings: Settings, weights: dict[str, float]) -> pd.DataFrame:
     """Combined walk-forward scores of the chosen strategies (for backtests)."""
-    return combine_frames({n: load_oos_scores(n) for n in weights}, weights)
+    return combine_frames({n: load_oos_scores(n, settings.report_key) for n in weights}, weights,
+                          settings.ensemble.abstain_on_zero)
 
 
 class LiveEnsemble:
@@ -94,6 +106,7 @@ class LiveEnsemble:
 
     def __init__(self, settings: Settings, weights: dict[str, float] | None = None):
         self.weights = weights or resolve_weights(settings)
+        self.abstain_on_zero = settings.ensemble.abstain_on_zero
         self.strategies: dict[str, Strategy] = {n: create(n, settings) for n in self.weights}
 
     def load(self) -> None:
@@ -113,4 +126,4 @@ class LiveEnsemble:
         missing = [n for n, v in parts.items() if v is None]
         if missing:
             log.warning("%s: no score from %s; weights renormalized", symbol, missing)
-        return combine(parts, self.weights), parts
+        return combine(parts, self.weights, self.abstain_on_zero), parts

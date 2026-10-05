@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
+from ..config import Settings
+from ..data.schema import timeframe_delta
 from ..ensemble import entry_side, exit_signal
 from ..labels.triple_barrier import IntrabarResolver, _to_ns, limit_through
 from ..trading.rules import SymbolRules, position_size
@@ -48,6 +50,14 @@ class BacktestParams:
     # (risk-based, raised to the exchange minimum, skipped above max_trade_risk_pct)
     rules: dict[str, SymbolRules] | None = None
     max_trade_risk_pct: float = 5.0
+    # cost reduction
+    stop_order: str = "market"  # "market" | "stop_limit": no slippage when the stop triggers
+    stop_limit_offset_atr: float = 0.1  # stop_limit: gaps beyond this are closed at market
+    exit_limit: bool = False  # time / signal exits as a limit at the close (maker); market
+    # at the next close if not filled
+    # portfolio limits (0 = no limit), counting open positions and pending entries
+    max_positions: int = 0
+    max_same_side: int = 0
 
 
 @dataclass
@@ -62,6 +72,7 @@ class Position:
     fees: float
     funding: float = 0.0
     bars_held: int = 0
+    atr: float = 0.0
 
 
 @dataclass
@@ -113,8 +124,9 @@ class Backtester:
         return price * (1 + s) if buy else price * (1 - s)
 
     def _close(self, pos: Position, raw_price: float, time: pd.Timestamp, reason: str,
-               maker: bool = False) -> float:
-        price = raw_price if maker else self._slip(raw_price, pos.side, opening=False)
+               maker: bool = False, no_slip: bool = False) -> float:
+        price = raw_price if (maker or no_slip) else self._slip(raw_price, pos.side,
+                                                                opening=False)
         exit_fee = pos.qty * price * (self.p.maker_fee if maker else self.p.fee)
         gross = pos.side * pos.qty * (price - pos.entry_price)
         pnl = gross - pos.fees - exit_fee - pos.funding
@@ -127,6 +139,7 @@ class Backtester:
         })
         self.cash += gross - exit_fee - pos.funding  # entry fee was paid at entry
         del self.positions[pos.symbol]
+        self.pending_exit.pop(pos.symbol, None)
         return pnl
 
     def _take(self, pos: Position, time: pd.Timestamp) -> None:
@@ -137,7 +150,12 @@ class Backtester:
         o, h, lo = bar["open"], bar["high"], bar["low"]
         # gap through a level at the open: filled at the open
         if (long and o <= pos.sl) or (not long and o >= pos.sl):
-            self._close(pos, o, t, "stop")
+            limit = pos.sl - pos.side * self.p.stop_limit_offset_atr * pos.atr
+            within = (o >= limit) if long else (o <= limit)
+            if self.p.stop_order == "stop_limit" and within:
+                self._close(pos, o, t, "stop", no_slip=True)
+            else:  # market stop, or a stop-limit skipped by the gap -> closed at market
+                self._close(pos, o, t, "stop")
             return
         if (long and o >= pos.tp) or (not long and o <= pos.tp):
             self._close(pos, o, t, "take", maker=self.p.take_profit_limit)
@@ -148,9 +166,12 @@ class Backtester:
             tp_first = self.resolvers[pos.symbol].tp_first(self._ns(t), pos.tp, pos.sl, long)
             tp_hit, sl_hit = tp_first, not tp_first
         if sl_hit:
-            self._close(pos, pos.sl, t + self.p.bar, "stop")
+            self._stop(pos, t + self.p.bar)
         elif tp_hit:
             self._take(pos, t + self.p.bar)
+
+    def _stop(self, pos: Position, time: pd.Timestamp) -> None:
+        self._close(pos, pos.sl, time, "stop", no_slip=self.p.stop_order == "stop_limit")
 
     def _fill_pending(self, s: str, order: PendingEntry, t: pd.Timestamp, bar: pd.Series) -> None:
         """Limit entry placed at the previous close: fill inside bar t or expire."""
@@ -173,10 +194,10 @@ class Backtester:
         self.limit_fills += 1
         fee = order.qty * price * self.p.maker_fee
         self.cash -= fee
-        pos = Position(s, order.side, t, price, order.qty, sl, tp, fee)
+        pos = Position(s, order.side, t, price, order.qty, sl, tp, fee, atr=order.atr)
         self.positions[s] = pos
         if outcome == "stop":
-            self._close(pos, sl, t + self.p.bar, "stop")
+            self._stop(pos, t + self.p.bar)
         elif outcome == "take":
             self._take(pos, t + self.p.bar)
 
@@ -213,7 +234,7 @@ class Backtester:
         self.positions[symbol] = Position(
             symbol, side, t_close, price, qty,
             sl=price - side * self.p.sl_atr * atr, tp=price + side * self.p.tp_atr * atr,
-            fees=fee)
+            fees=fee, atr=atr)
 
     @staticmethod
     def _ns(t: pd.Timestamp) -> int:
@@ -225,6 +246,7 @@ class Backtester:
         self.cash = p.initial_equity
         self.positions: dict[str, Position] = {}
         self.pending: dict[str, PendingEntry] = {}
+        self.pending_exit: dict[str, tuple[float, str]] = {}  # limit exit price, reason
         self.trades: list[dict] = []
         self.limit_orders = self.limit_fills = 0
         peak, halted_at = p.initial_equity, None
@@ -248,6 +270,15 @@ class Backtester:
                 bar = self.bars[s].loc[t]
                 self._charge_funding(pos, t, bar["close"])
                 self._check_barriers(pos, t, bar)
+                if s in self.positions and s in self.pending_exit:  # limit exit from last close
+                    price, reason = self.pending_exit[s]
+                    # a long is closed by a sell limit (needs a trade above it), a short by a buy
+                    level = limit_through(price, pos.side == -1)
+                    filled = bar["high"] >= level if pos.side == 1 else bar["low"] <= level
+                    if filled:
+                        self._close(pos, price, t + p.bar, reason, maker=True)
+                    else:
+                        self._close(pos, bar["close"], t + p.bar, reason)
 
             # 2. bar close: mark to market, risk limits
             closes = {s: self.bars[s].at[t, "close"] for s in self.symbols
@@ -267,15 +298,20 @@ class Backtester:
                 row = self.preds[s].loc[t]
                 close = closes[s]
                 pos = self.positions.get(s)
-                if pos is not None:
+                if pos is not None and s not in self.pending_exit:
                     pos.bars_held += 1
-                    if pos.bars_held >= p.horizon:
-                        self._close(pos, close, t_close, "time")
-                    elif exit_signal(pos.side, row["score"], p.exit_score):
-                        self._close(pos, close, t_close, "signal")
+                    reason = ("time" if pos.bars_held >= p.horizon else
+                              "signal" if exit_signal(pos.side, row["score"], p.exit_score)
+                              else None)
+                    if reason and p.exit_limit:
+                        self.pending_exit[s] = (close, reason)
+                    elif reason:
+                        self._close(pos, close, t_close, reason)
                 if s in self.positions or halted_at is not None or day_blocked:
                     continue
                 side = entry_side(row["score"], p.enter_score)
+                if side and not self._portfolio_allows(side):
+                    side = 0
                 if side:
                     self._enter(s, side, t_close, close, row["atr"], self._equity(closes))
             equity_curve[t_close] = self._equity(closes)
@@ -285,6 +321,15 @@ class Backtester:
             self._close(self.positions[s], last[s], self.bars[s].index[-1] + p.bar, "end")
         return BacktestResult(pd.DataFrame(self.trades), pd.Series(equity_curve, name="equity"),
                               halted_at, self.limit_orders, self.limit_fills)
+
+    def _portfolio_allows(self, side: int) -> bool:
+        sides = [pos.side for pos in self.positions.values()]
+        sides += [o.side for o in self.pending.values()]
+        if self.p.max_positions and len(sides) >= self.p.max_positions:
+            return False
+        if self.p.max_same_side and sum(1 for x in sides if x == side) >= self.p.max_same_side:
+            return False
+        return True
 
     def _equity(self, closes: dict[str, float]) -> float:
         unrealized = sum(
@@ -299,3 +344,33 @@ def run_backtest(
     intrabar: dict[str, pd.DataFrame] | None = None,
 ) -> BacktestResult:
     return Backtester(bars, predictions, params, funding, intrabar).run()
+
+
+def params_from(settings: Settings, enter: float, exit_: float,
+                rules: dict[str, SymbolRules] | None = None) -> BacktestParams:
+    """Backtest parameters equal to the live bot's rules in `settings`."""
+    return BacktestParams(
+        initial_equity=settings.backtest.initial_equity,
+        risk_pct=settings.risk.per_trade_pct,
+        max_leverage=settings.risk.max_leverage,
+        fee=settings.execution.fee_taker,
+        maker_fee=settings.execution.fee_maker,
+        slippage_bps=settings.execution.slippage_bps,
+        entry=settings.execution.entry_order,
+        limit_offset_atr=settings.execution.limit_offset_atr,
+        take_profit_limit=settings.execution.take_profit_limit,
+        tp_atr=settings.label.tp_atr,
+        sl_atr=settings.label.sl_atr,
+        horizon=settings.label.horizon_bars,
+        enter_score=enter,
+        exit_score=exit_,
+        daily_loss_pct=settings.risk.daily_loss_pct,
+        max_dd_pct=settings.risk.max_dd_pct,
+        bar=timeframe_delta(settings.timeframe),
+        rules=rules,
+        max_trade_risk_pct=settings.risk.max_trade_risk_pct,
+        stop_order=settings.execution.stop_order,
+        stop_limit_offset_atr=settings.execution.stop_limit_offset_atr,
+        max_positions=settings.risk.max_positions,
+        max_same_side=settings.risk.max_same_side,
+    )

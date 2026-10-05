@@ -63,3 +63,15 @@ def mfi(
 def parkinson_vol(high: pd.Series, low: pd.Series, n: int) -> pd.Series:
     hl = np.log(high / low) ** 2
     return np.sqrt(hl.rolling(n).mean() / (4 * np.log(2)))
+
+
+def adx(high: pd.Series, low: pd.Series, close: pd.Series, n: int = 14) -> pd.Series:
+    """Average Directional Index: trend strength 0..100 regardless of direction."""
+    up, down = high.diff(), -low.diff()
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+    atr_ = wilder(true_range(high, low, close), n)
+    plus_di = 100 * wilder(plus_dm, n) / atr_
+    minus_di = 100 * wilder(minus_dm, n) / atr_
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    return wilder(dx, n)

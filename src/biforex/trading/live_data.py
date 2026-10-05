@@ -17,11 +17,16 @@ from ..features import indicators as ind
 log = logging.getLogger(__name__)
 
 
-def refresh_data(settings: Settings, symbols: list[str], session: requests.Session) -> None:
-    """Klines (trading timeframe) + funding + metrics; metrics tail via REST."""
+def refresh_data(settings: Settings, symbols: list[str], session: requests.Session,
+                 extra_intervals: tuple[str, ...] = ()) -> None:
+    """Klines (trading timeframe + intervals the strategies need) + funding + metrics;
+    metrics tail via REST."""
     tf = settings.timeframe
     for s in symbols:
         update_klines(settings, s, tf, session)
+        for interval in extra_intervals:
+            if interval != tf and s in settings.symbols:
+                update_klines(settings, s, interval, session)
         update_funding(settings, s, session)
         update_metrics(settings, s, session)
         path = store.metrics_path(settings.data.dir, s)
@@ -49,6 +54,12 @@ class Scorer:
         self.settings = settings
         self.ensemble = ensemble or LiveEnsemble(settings)
         self.ensemble.load()
+
+    @property
+    def data_intervals(self) -> tuple[str, ...]:
+        """Extra kline intervals the enabled strategies read live."""
+        return tuple(sorted({i for s in self.ensemble.strategies.values()
+                             for i in s.data_intervals}))
 
     def market(self, symbol: str, bar: pd.Timestamp) -> tuple[float, float] | None:
         """Close and ATR of the bar."""

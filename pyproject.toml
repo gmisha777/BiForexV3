@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ml = ["lightgbm>=4.3", "scikit-learn>=1.4", "shap>=0.45"]
+ml = ["lightgbm>=4.3", "scikit-learn>=1.4", "shap>=0.45", "minisom>=2.3"]
 dev = ["pytest>=8", "ruff>=0.4"]
 
 [tool.setuptools.packages.find]

@@ -10,7 +10,7 @@ from biforex.strategies.lgbm_tb import probs_to_score
 
 def test_weighted_mean_and_missing_strategy_renormalizes():
     w = {"a": 1.0, "b": 3.0}
-    assert combine({"a": 0.4, "b": 0.0}, w) == pytest.approx(0.1)
+    assert combine({"a": 0.4, "b": 0.0}, w, abstain_on_zero=False) == pytest.approx(0.1)
     assert combine({"a": 0.4, "b": None}, w) == pytest.approx(0.4)
     assert combine({"a": None, "b": None}, w) is None
 
@@ -26,11 +26,20 @@ def test_resolve_weights_from_config_and_arguments():
         resolve_weights(s, ["a", "b"], [1])
 
 
+def test_zero_score_abstains_by_default():
+    w = {"a": 1.0, "b": 1.0}
+    assert combine({"a": 0.2, "b": 0.0}, w) == pytest.approx(0.2)
+    assert combine({"a": 0.2, "b": 0.0}, w, abstain_on_zero=False) == pytest.approx(0.1)
+    assert combine({"a": 0.0, "b": 0.0}, w) == 0.0  # everyone abstained: no view, not missing
+    assert combine({"a": 0.0, "b": None}, w) == 0.0
+    assert combine({"a": None, "b": None}, w) is None
+
+
 def test_combine_frames_aligns_by_time_and_symbol():
     t = pd.date_range("2024-01-01", periods=2, freq="4h", tz="UTC", name="open_time")
     a = pd.DataFrame({"symbol": ["X", "X"], "score": [0.2, 0.4]}, index=t)
     b = pd.DataFrame({"symbol": ["X"], "score": [-0.2]}, index=t[:1])
-    out = combine_frames({"a": a, "b": b}, {"a": 1.0, "b": 1.0})
+    out = combine_frames({"a": a, "b": b}, {"a": 1.0, "b": 1.0}, abstain_on_zero=False)
     assert out["score"].tolist() == pytest.approx([0.0, 0.4])
     assert out["n_strategies"].tolist() == [2, 1]
 

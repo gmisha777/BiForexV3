@@ -1,0 +1,108 @@
+# RESEARCH copy of config.yaml on the 1-hour timeframe (not used by the bot).
+# Train only with --no-final so live models are not replaced.
+
+symbols: [BTCUSDT, ETHUSDT]
+timeframe: 1h
+
+data:
+  dir: data                  # relative to project root
+  history_start: 2020-01-01
+  intervals: [4h, 1h, 1m]    # 1m resolves bars where both SL and TP were touched
+  funding: true
+  metrics: true              # open interest, long/short ratios (5-minute, daily archives)
+  download_workers: 8
+  extra_symbols: []          # downloaded for training only, not traded
+
+features:
+  context_symbol: BTCUSDT    # its returns/volatility are added as features for other symbols
+  higher_timeframes: [4h, 1d]
+  metrics_max_staleness: 3h  # open interest older than this counts as missing
+  warmup_bars: 700           # first bars dropped: long EMAs are not ready yet
+
+label:                       # triple-barrier labels = SHARED exit rules of all strategies
+  horizon_bars: 24           # 24 x 1h = 1 day (48 was worse on H1)
+  tp_atr: 2.0                # take profit, ATR multiples
+  sl_atr: 1.0                # stop loss, ATR multiples
+  atr_period: 14
+  intrabar_interval: 1m      # resolves bars where both TP and SL were touched
+
+strategies:                  # decision approaches; each gives a score -1 (down) .. +1 (up)
+  lgbm_tb:                   # LightGBM on triple-barrier labels (settings in "model" below)
+    enabled: true
+    weight: 1.0              # combined score = weighted mean over enabled strategies
+  flow_1m:                   # LightGBM on intrabar order flow from 1m bars
+    enabled: false           # research: enable only after the ensemble backtest shows a gain
+    weight: 1.0
+  trend_regime:              # rule: EMA trend in ATR units, only when ADX shows a trend
+    enabled: false
+    weight: 1.0
+  crowd:                     # LightGBM on crowd positioning only (funding, OI, long/short)
+    enabled: false
+    weight: 1.0
+  som_regime:                # Kohonen map regimes + small LightGBM per regime (legacy block 4)
+    enabled: false
+    weight: 1.0
+  meta_filter:               # trusts / distrusts each lgbm_tb signal; use INSTEAD of lgbm_tb
+    enabled: false
+    weight: 1.0
+  shock_move:                # rule: after a >= N ATR move with a flush, fade or follow it
+    enabled: false
+    weight: 1.0
+  squeeze_breakout:          # rule: breakout of the range after volatility compression
+    enabled: false
+    weight: 1.0
+
+ensemble:
+  enter_score: 0.10          # open when combined score >= +this (long) or <= -this (short)
+  exit_score: 0.10           # close when the score reaches this against the position
+                             # (lgbm_tb alone: 0.10 == old rule "p >= 0.40 and dominant")
+  abstain_on_zero: true      # a strategy scoring exactly 0 has no view and is left out
+
+model:                       # strategy lgbm_tb: LightGBM, 3 classes down / flat / up
+  pooled: true               # one model for all symbols (symbol_id feature); more data, more stable
+  val_fraction: 0.15         # tail of the training window used for early stopping
+  early_stopping_rounds: 300
+  params:                    # strongly regularized: with lighter settings it overfit in <10 trees
+    n_estimators: 3000
+    learning_rate: 0.01
+    num_leaves: 8
+    min_child_samples: 1000   # 4x more rows than on 4h
+    subsample: 0.7
+    subsample_freq: 1
+    colsample_bytree: 0.5
+    reg_lambda: 10.0
+
+backtest:
+  initial_equity: 5000       # same as the demo account
+  threshold_grid: [0.04, 0.07, 0.10, 0.13, 0.175]  # enter/exit score (= p 0.36..0.45), all shown
+
+risk:
+  per_trade_pct: 1.0         # target risk to the stop, % of equity
+  max_trade_risk_pct: 5.0    # exchange minimum order may force more; skip the trade above this
+  max_leverage: 5            # total open notional / equity (BTC min order is ~84 USDT)
+  daily_loss_pct: 6.0        # no new entries for the rest of the UTC day
+  max_dd_pct: 30.0           # stop opening positions for good; reset by hand
+
+execution:
+  testnet: false
+  fee_taker: 0.0005
+  fee_maker: 0.0002
+  slippage_bps: 2            # market orders only
+  entry_order: limit         # limit entries: half the fee; backtest +10..+25 pp vs market
+  limit_offset_atr: 0.1      # limit price 0.1 ATR better than the signal bar close, valid 1 bar
+  take_profit_limit: true    # TP rests as a limit order (maker); SL is a stop-market
+  exchange_leverage: 10      # exchange setting (isolated): only margin locked per position;
+                             # risk is limited by risk.max_leverage and the stop
+
+retrain:
+  every_days: 7
+  train_months: 36
+
+bot:
+  poll_seconds: 30           # position / protective-order check interval
+  bar_close_delay_seconds: 20  # wait after the 4h close so the exchange publishes the bar
+  metrics_rest_hours: 40     # open interest etc. fetched via REST (archives lag one day)
+
+logging:
+  level: INFO
+  dir: logs

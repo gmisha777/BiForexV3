@@ -16,10 +16,9 @@ import pandas as pd
 import requests
 
 from biforex.backtest import metrics
-from biforex.backtest.engine import BacktestParams, run_backtest
+from biforex.backtest.engine import params_from, run_backtest
 from biforex.config import PROJECT_ROOT, Settings, load_settings
 from biforex.data import store
-from biforex.data.schema import timeframe_delta
 from biforex.ensemble import load_oos, resolve_weights
 from biforex.labels.build import labels_path
 from biforex.log import setup_logging
@@ -28,31 +27,6 @@ from biforex.trading.rules import SymbolRules
 log = logging.getLogger("backtest")
 pd.set_option("display.width", 160)
 pd.set_option("display.max_columns", 20)
-
-
-def params_from(settings: Settings, enter: float, exit_: float,
-                rules: dict[str, SymbolRules] | None = None) -> BacktestParams:
-    return BacktestParams(
-        initial_equity=settings.backtest.initial_equity,
-        risk_pct=settings.risk.per_trade_pct,
-        max_leverage=settings.risk.max_leverage,
-        fee=settings.execution.fee_taker,
-        maker_fee=settings.execution.fee_maker,
-        slippage_bps=settings.execution.slippage_bps,
-        entry=settings.execution.entry_order,
-        limit_offset_atr=settings.execution.limit_offset_atr,
-        take_profit_limit=settings.execution.take_profit_limit,
-        tp_atr=settings.label.tp_atr,
-        sl_atr=settings.label.sl_atr,
-        horizon=settings.label.horizon_bars,
-        enter_score=enter,
-        exit_score=exit_,
-        daily_loss_pct=settings.risk.daily_loss_pct,
-        max_dd_pct=settings.risk.max_dd_pct,
-        bar=timeframe_delta(settings.timeframe),
-        rules=rules,
-        max_trade_risk_pct=settings.risk.max_trade_risk_pct,
-    )
 
 
 def attach_atr(settings: Settings, preds: pd.DataFrame) -> pd.DataFrame:
@@ -72,6 +46,8 @@ def main() -> int:
                         help="apply Binance minimum order sizes (as the live bot does)")
     parser.add_argument("--strategies", nargs="+", help="strategies to combine (default: config)")
     parser.add_argument("--weights", nargs="+", type=float, help="weights for --strategies")
+    parser.add_argument("--any-coverage", action="store_true",
+                        help="also use bars scored by only some of the strategies")
     args = parser.parse_args()
     settings = load_settings(args.config)
     if args.equity:
@@ -81,10 +57,12 @@ def main() -> int:
     weights = resolve_weights(settings, args.strategies, args.weights)
     preds = load_oos(settings, weights)
     preds = preds[preds["symbol"].isin(settings.symbols)]  # extra symbols are not traded
+    if not args.any_coverage:  # compare strategies on the period they all cover
+        preds = preds[preds["n_strategies"] == len(weights)]
     symbols = sorted(preds["symbol"].unique())
     preds = attach_atr(settings, preds)
     name = "+".join(f"{n}x{w:g}" for n, w in weights.items())
-    report_dir = PROJECT_ROOT / "reports" / "ensemble" / name
+    report_dir = PROJECT_ROOT / "reports" / "ensemble" / settings.report_key / name
     log.info("ensemble %s: %d scored bars %s -> %s; bars scored by all strategies: %.0f%%",
              weights, len(preds), preds.index[0].date(), preds.index[-1].date(),
              100 * (preds["n_strategies"] == len(weights)).mean())

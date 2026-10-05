@@ -132,3 +132,46 @@ def test_metrics_summary_runs():
     s = metrics.summary(r, 10_000)
     assert s["trades"] == 1 and s["win_rate_pct"] == 100
     assert s["total_return_pct"] == pytest.approx(2.0)
+
+
+def test_stop_limit_fills_at_stop_without_slippage():
+    rows = [FLAT, (100, 100.5, 97, 98), FLAT, FLAT]  # stop 98 touched inside bar 1
+    base = dict(fee=0.0005, slippage_bps=10)
+    market = run(rows, {0: "up"}, **base).trades.iloc[0]
+    stop_limit = run(rows, {0: "up"}, **base, stop_order="stop_limit").trades.iloc[0]
+    stop = stop_limit["entry"] - 2.0  # 1 ATR below the (slipped) entry
+    assert stop_limit["exit"] == pytest.approx(stop) and market["exit"] < stop
+
+
+def test_stop_limit_gap_beyond_offset_closes_at_market_open():
+    rows = [FLAT, (95, 95.5, 94, 95), FLAT]  # opens far below the stop 98 (limit 97.8)
+    t = run(rows, {0: "up"}, stop_order="stop_limit", slippage_bps=10).trades.iloc[0]
+    assert t["reason"] == "stop" and t["exit"] < 95  # market fill at the open, with slippage
+
+
+def test_limit_exit_is_maker_when_next_bar_trades_through():
+    rows = [FLAT] * 3 + [(100, 100.6, 99.6, 100.2), FLAT]
+    r = run(rows, {0: "up"}, horizon=2, exit_limit=True, fee=0.0005, maker_fee=0.0002)
+    t = r.trades.iloc[0]
+    assert t["reason"] == "time" and t["exit"] == pytest.approx(100.0)  # close of bar 2
+    assert t["fees"] == pytest.approx(t["qty"] * 100 * 0.0002 + t["qty"] * t["entry"] * 0.0005)
+
+
+def test_limit_exit_falls_back_to_market_at_next_close():
+    rows = [FLAT] * 3 + [(99.9, 99.95, 99.0, 99.2), FLAT]  # never trades back up to 100
+    t = run(rows, {0: "up"}, horizon=2, exit_limit=True, slippage_bps=0).trades.iloc[0]
+    assert t["exit"] == pytest.approx(99.2)
+
+
+def test_portfolio_limits_cap_simultaneous_positions():
+    t = pd.date_range(T0, periods=6, freq="4h")
+    preds = pd.concat([
+        pd.DataFrame({"symbol": sym, "score": [0.3] + [0.0] * 5, "atr": 2.0}, index=t)
+        for sym in ("A", "B", "C")])
+    bars = {sym: make_bars([FLAT] * 6) for sym in ("A", "B", "C")}
+    params = BacktestParams(**{**NO_COSTS, "horizon": 5})
+    assert len(run_backtest(bars, preds, params).trades) == 3
+    params.max_same_side = 2
+    assert len(run_backtest(bars, preds, params).trades) == 2
+    params.max_same_side, params.max_positions = 0, 1
+    assert len(run_backtest(bars, preds, params).trades) == 1

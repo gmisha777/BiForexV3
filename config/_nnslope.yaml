@@ -1,0 +1,92 @@
+# RESEARCH: nn_slope on 1h, trained on 10 pairs, traded BTC/ETH (not used by the bot)
+symbols:
+- BTCUSDT
+- ETHUSDT
+timeframe: 1h
+data:
+  dir: data
+  history_start: 2020-01-01
+  intervals:
+  - 4h
+  - 1h
+  - 1m
+  funding: true
+  metrics: true
+  download_workers: 8
+  extra_symbols:
+  - SOLUSDT
+  - BNBUSDT
+  - XRPUSDT
+  - DOGEUSDT
+  - ADAUSDT
+  - LINKUSDT
+  - LTCUSDT
+  - AVAXUSDT
+features:
+  context_symbol: BTCUSDT
+  higher_timeframes:
+  - 4h
+  - 1d
+  metrics_max_staleness: 3h
+  warmup_bars: 700
+label:
+  horizon_bars: 24
+  tp_atr: 2.0
+  sl_atr: 1.0
+  atr_period: 14
+  intrabar_interval: 1m
+strategies:
+  nn_slope:
+    enabled: false
+    weight: 1.0
+ensemble:
+  enter_score: 0.1
+  exit_score: 0.1
+  abstain_on_zero: true
+model:
+  pooled: true
+  val_fraction: 0.15
+  early_stopping_rounds: 300
+  params:
+    n_estimators: 3000
+    learning_rate: 0.01
+    num_leaves: 8
+    min_child_samples: 1000
+    subsample: 0.7
+    subsample_freq: 1
+    colsample_bytree: 0.5
+    reg_lambda: 10.0
+backtest:
+  initial_equity: 5000
+  threshold_grid:
+  - 0.04
+  - 0.07
+  - 0.1
+  - 0.13
+  - 0.175
+risk:
+  per_trade_pct: 1.0
+  max_trade_risk_pct: 5.0
+  max_leverage: 5
+  daily_loss_pct: 6.0
+  max_dd_pct: 30.0
+execution:
+  testnet: false
+  fee_taker: 0.0005
+  fee_maker: 0.0002
+  slippage_bps: 2
+  entry_order: limit
+  limit_offset_atr: 0.1
+  take_profit_limit: true
+  exchange_leverage: 10
+retrain:
+  every_days: 7
+  train_months: 36
+bot:
+  poll_seconds: 30
+  bar_close_delay_seconds: 20
+  metrics_rest_hours: 40
+logging:
+  level: INFO
+  dir: logs
+report_tag: slope
